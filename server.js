@@ -1,309 +1,336 @@
-// ============================================================================
-// COESPA Conectado — servidor (sinalização WebSocket + cadastro/login)
-// ----------------------------------------------------------------------------
-// Este arquivo tem duas partes:
-//   1) A parte de WebSocket (salas, GPS, vídeo, controle de prova) — é a
-//      mesma lógica que você já tinha, só com uma checagem nova no "join".
-//   2) A parte NOVA: três rotas HTTP para cadastro e login, que conversam
-//      com o banco de dados no Supabase.
-// ============================================================================
+// Servidor de sinalização + login + persistência do COESPA Conectado.
+// Esta versão NÃO serve o HTML — o frontend fica hospedado à parte (ex.: Hostinger),
+// porque hospedagens compartilhadas comuns não rodam Node.js / WebSocket.
+// Publique este arquivo em um serviço que rode Node.js continuamente (ex.: Render).
+// A URL gerada (ex.: https://coespa-servidor.onrender.com) alimenta DUAS constantes
+// no index.html: SIGNALING_URL (trocando "https://" por "wss://") e API_URL
+// (a mesma URL, com "https://" mesmo — é usada para login/cadastro via fetch).
+//
+// ===== Variáveis de ambiente necessárias (configurar no painel do Render) =====
+//   SUPABASE_URL              -> Project URL (Settings → API, no painel do Supabase)
+//   SUPABASE_SERVICE_ROLE_KEY -> service_role key (Settings → API) — NUNCA no front-end
+//   SEF_USERNAME, SEF_PASSWORD-> login "de fábrica" da SEF/Central (funciona mesmo
+//                                sem nenhuma linha no banco — resolve o problema de
+//                                "quem cadastra o primeiro usuário?")
+//   JWT_SECRET                -> qualquer texto longo e aleatório, mantido em segredo
+//   CORS_ORIGIN (opcional)    -> domínio da Hostinger (ex.: https://seusite.com);
+//                                sem isso, aceita qualquer origem ("*")
+//
+// ===== Tabelas do Supabase (rodar uma vez no SQL Editor do projeto) =====
+//   create table app_users (
+//     id bigint generated always as identity primary key,
+//     username text unique not null,
+//     password_hash text not null,
+//     name text not null,
+//     role text not null check (role in ('athlete','central')),
+//     created_at timestamptz default now()
+//   );
+//   create table competitions (
+//     pin text primary key,
+//     name text,
+//     created_at timestamptz default now(),
+//     race_started boolean default false,
+//     course jsonb default '[]'::jsonb,
+//     map_url text,
+//     map_corners jsonb,
+//     map_opacity double precision
+//   );
+//   create table gps_log (
+//     id bigint generated always as identity primary key,
+//     pin text,
+//     athlete_uid text,
+//     athlete_name text,
+//     lat double precision, lon double precision, alt double precision,
+//     accuracy double precision, dist double precision, elev double precision,
+//     recorded_at timestamptz default now()
+//   );
+//
+// Teste local: defina as variáveis de ambiente (ex.: num arquivo .env carregado
+// manualmente) e rode: npm install && npm start
 
-const WebSocket = require("ws");
 const http = require("http");
 const express = require("express");
-const { Pool } = require("pg");
+const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { createClient } = require("@supabase/supabase-js");
+const WebSocket = require("ws");
 
-// ----------------------------------------------------------------------------
-// Configuração — estes valores NUNCA ficam escritos no código. Eles vêm de
-// "variáveis de ambiente" que você vai cadastrar no painel do Render
-// (aba "Environment"). Isso evita que a senha do banco ou a chave secreta
-// apareçam no GitHub ou em qualquer lugar público.
-// ----------------------------------------------------------------------------
-const DATABASE_URL = process.env.DATABASE_URL;   // string de conexão do Supabase
-const JWT_SECRET = process.env.JWT_SECRET;       // uma frase secreta, só sua, para "assinar" os tokens
-const SETUP_KEY = process.env.SETUP_KEY;         // senha extra, só para criar o PRIMEIRO usuário SEF
+const PORT = process.env.PORT || 8080;
+const JWT_SECRET = process.env.JWT_SECRET || "troque-este-segredo-antes-de-publicar";
+const SEF_USERNAME = (process.env.SEF_USERNAME || "sef").toLowerCase();
+const SEF_PASSWORD = process.env.SEF_PASSWORD || "1234";
 
-if (!DATABASE_URL || !JWT_SECRET || !SETUP_KEY) {
-  console.warn(
-    "AVISO: faltam variáveis de ambiente (DATABASE_URL, JWT_SECRET ou SETUP_KEY). " +
-    "Configure-as no painel do Render em Environment antes de usar o cadastro/login."
-  );
-}
+const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+if (!supabase) console.warn("[aviso] SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY não configurados — login de atletas e persistência ficam indisponíveis (a SEF ainda consegue entrar com SEF_USERNAME/SEF_PASSWORD).");
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // o Supabase exige conexão criptografada
-});
-
-// ----------------------------------------------------------------------------
-// Servidor HTTP (Express) — recebe as chamadas de cadastro/login do site
-// ----------------------------------------------------------------------------
 const app = express();
-app.use(express.json());
+app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
+app.use(express.json({ limit: "8mb" })); // o mapa da prova vai embutido como imagem (base64), por isso o limite maior
 
-// Permite que o site (hospedado em outro domínio, na Hostinger) chame estas
-// rotas. Sem isso, o navegador bloqueia a chamada por segurança (CORS).
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-setup-key");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-app.get("/", (req, res) => {
-  res.send("COESPA Conectado — servidor no ar.");
-});
-
-// Confere se quem está chamando a rota enviou um token válido de SEF/Central.
-// Isso é o que garante que só a SEF cadastra gente nova.
-function requireCentral(req, res, next) {
+// ===== Autenticação HTTP (login/cadastro) =====
+function signToken(user) { return jwt.sign({ role: user.role, username: user.username }, JWT_SECRET, { expiresIn: "12h" }); }
+function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Não autenticado." });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload.role !== "central") {
-      return res.status(403).json({ error: "Só a SEF pode fazer isso." });
-    }
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Sessão inválida ou expirada. Faça login novamente." });
-  }
+  if (!token) return res.status(401).json({ error: "Sem token de acesso." });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: "Sessão inválida ou expirada. Faça login novamente." }); }
+}
+function requireCentral(req, res, next) {
+  if (req.user?.role !== "central") return res.status(403).json({ error: "Só a SEF / Central pode fazer isso." });
+  next();
 }
 
-// --- LOGIN --------------------------------------------------------------
-// O navegador manda usuário e senha; o servidor confere no banco e, se
-// bater, devolve um "token" (um crachá temporário) que o navegador guarda
-// e usa depois para provar quem é, sem precisar mandar a senha de novo.
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: "Informe usuário e senha." });
+  if (!username || !password) return res.status(400).json({ error: "Preencha usuário e senha." });
+  const u = String(username).trim().toLowerCase();
+
+  // Login "de fábrica" da SEF — sempre funciona, mesmo com o banco vazio ou fora do ar.
+  if (u === SEF_USERNAME && password === SEF_PASSWORD) {
+    const user = { role: "central", username: u, name: "SEF / CENTRAL" };
+    return res.json({ token: signToken(user), user });
   }
+
+  if (!supabase) return res.status(503).json({ error: "Banco de dados não configurado no servidor." });
   try {
-    const { rows } = await pool.query("select * from users where username=$1", [username]);
-    const user = rows[0];
-    if (!user) return res.status(401).json({ error: "Usuário ou senha inválidos." });
-
-    const senhaCorreta = await bcrypt.compare(password, user.password_hash);
-    if (!senhaCorreta) return res.status(401).json({ error: "Usuário ou senha inválidos." });
-
-    const token = jwt.sign(
-      { sub: user.id, username: user.username, role: user.role, name: user.name },
-      JWT_SECRET,
-      { expiresIn: "18h" }
-    );
-    res.json({ token, user: { id: user.id, username: user.username, role: user.role, name: user.name } });
-  } catch (err) {
-    console.error("Erro no login:", err);
-    res.status(500).json({ error: "Erro no servidor." });
+    const { data, error } = await supabase.from("app_users").select("*").eq("username", u).maybeSingle();
+    if (error) throw error;
+    if (!data || !(await bcrypt.compare(password, data.password_hash))) {
+      return res.status(401).json({ error: "Usuário ou senha incorretos." });
+    }
+    const user = { role: data.role, username: data.username, name: data.name };
+    res.json({ token: signToken(user), user });
+  } catch (e) {
+    console.error("Erro no login:", e.message);
+    res.status(500).json({ error: "Erro ao consultar o banco de dados." });
   }
 });
 
-// --- CADASTRO (só a SEF pode chamar) ------------------------------------
-app.post("/api/register", requireCentral, async (req, res) => {
+app.post("/api/register", requireAuth, requireCentral, async (req, res) => {
   const { username, password, name, role } = req.body || {};
-  if (!username || !password || !name || !role) {
-    return res.status(400).json({ error: "Preencha todos os campos." });
+  if (!username || !password || !name || password.length < 4 || !["athlete", "central"].includes(role)) {
+    return res.status(400).json({ error: "Preencha nome, usuário, um perfil válido e uma senha com pelo menos 4 caracteres." });
   }
-  if (!["athlete", "central"].includes(role)) {
-    return res.status(400).json({ error: "Papel inválido." });
-  }
-  if (String(password).length < 4) {
-    return res.status(400).json({ error: "A senha precisa ter pelo menos 4 caracteres." });
-  }
+  if (!supabase) return res.status(503).json({ error: "Banco de dados não configurado no servidor." });
   try {
-    const existe = await pool.query("select id from users where username=$1", [username]);
-    if (existe.rows.length) {
-      return res.status(409).json({ error: "Esse nome de usuário já existe." });
-    }
     const hash = await bcrypt.hash(password, 10);
-    const { rows } = await pool.query(
-      "insert into users(name, role, username, password_hash) values ($1,$2,$3,$4) returning id, name, role, username, created_at",
-      [name, role, username, hash]
-    );
-    res.status(201).json({ user: rows[0] });
-  } catch (err) {
-    console.error("Erro no cadastro:", err);
-    res.status(500).json({ error: "Erro no servidor." });
+    const { error } = await supabase.from("app_users").insert({
+      username: String(username).trim().toLowerCase(), password_hash: hash, name: String(name).trim(), role,
+    });
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ error: "Esse usuário já existe." });
+      throw error;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erro ao cadastrar usuário:", e.message);
+    res.status(500).json({ error: "Erro ao cadastrar." });
   }
 });
 
-// --- LISTAR USUÁRIOS (só a SEF vê) --------------------------------------
-// Serve para a tela da SEF mostrar, em qualquer aparelho, todos os atletas
-// já cadastrados — resolvendo o problema de sincronização entre dispositivos.
-app.get("/api/users", requireCentral, async (req, res) => {
+app.get("/api/users", requireAuth, requireCentral, async (req, res) => {
+  if (!supabase) return res.json({ users: [] });
   try {
-    const { rows } = await pool.query(
-      "select id, name, role, username, created_at from users order by created_at desc"
-    );
-    res.json({ users: rows });
-  } catch (err) {
-    console.error("Erro ao listar usuários:", err);
-    res.status(500).json({ error: "Erro no servidor." });
+    const { data, error } = await supabase.from("app_users").select("username,name,role").order("name");
+    if (error) throw error;
+    res.json({ users: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: "Erro ao consultar o banco de dados." });
   }
 });
 
-// --- CRIAÇÃO DO PRIMEIRO USUÁRIO (uso único) ----------------------------
-// Como só a SEF pode cadastrar gente, e no início não existe NENHUMA SEF
-// cadastrada, esta rota especial cria a primeira conta. Ela só funciona:
-//   a) se a tabela de usuários estiver vazia, e
-//   b) se quem chamar souber a "SETUP_KEY" (uma senha extra que só você,
-//      o desenvolvedor, vai saber — ela fica só no Render, não no site).
-// Depois que existir 1 usuário, esta rota se desativa sozinha.
-app.post("/api/setup-first-admin", async (req, res) => {
+// Resposta simples em / , só para health check do serviço de hospedagem.
+app.get("/", (req, res) => {
+  res.type("text/plain").send("COESPA Conectado — servidor de sinalização no ar.");
+});
+
+// ===== Persistência (Supabase) — funções auxiliares, nunca travam a sinalização =====
+async function loadCompetition(pin) {
+  if (!supabase) return null;
   try {
-    const chave = req.headers["x-setup-key"];
-    if (!chave || chave !== SETUP_KEY) {
-      return res.status(403).json({ error: "Chave de configuração inválida." });
-    }
-    const { rows: contagem } = await pool.query("select count(*)::int as total from users");
-    if (contagem[0].total > 0) {
-      return res.status(403).json({ error: "Já existe usuário cadastrado. Use o login normal." });
-    }
-    const { username, password, name } = req.body || {};
-    if (!username || !password || !name) {
-      return res.status(400).json({ error: "Preencha todos os campos." });
-    }
-    const hash = await bcrypt.hash(password, 10);
-    const { rows } = await pool.query(
-      "insert into users(name, role, username, password_hash) values ($1,'central',$2,$3) returning id, name, role, username",
-      [name, username, hash]
-    );
-    res.status(201).json({ user: rows[0] });
-  } catch (err) {
-    console.error("Erro ao criar primeiro usuário:", err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
+    const { data } = await supabase.from("competitions").select("*").eq("pin", pin).maybeSingle();
+    return data || null;
+  } catch { return null; }
+}
+async function upsertCompetition(pin, patch) {
+  if (!supabase) return;
+  try { await supabase.from("competitions").upsert({ pin, ...patch }); }
+  catch (e) { console.error("Erro ao salvar competição:", e.message); }
+}
+function logGps(pin, msg) {
+  if (!supabase) return;
+  supabase.from("gps_log").insert({
+    pin, athlete_uid: msg.uid, athlete_name: msg.name,
+    lat: msg.lat, lon: msg.lon, alt: msg.alt, accuracy: msg.accuracy, dist: msg.dist, elev: msg.elev,
+  }).then(({ error }) => { if (error) console.error("Erro ao gravar GPS:", error.message); });
+}
 
-// ----------------------------------------------------------------------------
-// Servidor WebSocket (sinalização) — mesma lógica de antes, com UMA mudança:
-// no "join", se o papel for "central" ou "athlete", agora é obrigatório
-// enviar um token válido (recebido no /api/login). Isso fecha a brecha de
-// alguém simplesmente "se declarar" SEF sem ter feito login de verdade.
-// ----------------------------------------------------------------------------
+// ===== Servidor HTTP + WebSocket (sinalização) =====
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const rooms = new Map();
-const getRoom = (id) => {
-  if (!rooms.has(id)) rooms.set(id, new Map());
-  return rooms.get(id);
-};
+let nextId = 1;
+const rooms = new Map(); // room -> Map(id -> {id, ws, role, name, uid})
+const raceState = new Map(); // room -> boolean (prova iniciada?)
+const competitionNames = new Map(); // room -> nome da competição (informado pela Central)
+const courseState = new Map(); // room -> array de pontos do percurso (largada/controles/chegada)
+const mapImageState = new Map(); // room -> {url, corners, opacity} do mapa georreferenciado, ou null
+
+function peersOf(room) {
+  if (!rooms.has(room)) rooms.set(room, new Map());
+  return rooms.get(room);
+}
+
+function broadcastToRoom(room, msg, excludeId) {
+  const peers = peersOf(room);
+  peers.forEach(p => {
+    if (p.id !== excludeId && p.ws.readyState === WebSocket.OPEN) {
+      p.ws.send(JSON.stringify(msg));
+    }
+  });
+}
 
 wss.on("connection", (ws) => {
-  ws.id = Math.random().toString(36).slice(2);
-  ws.roomId = null;
-  ws.meta = {};
-  ws.isAlive = true;
-  ws.on("pong", () => { ws.isAlive = true; });
+  ws.id = nextId++;
+  ws.room = null;
+  ws.role = null;
 
-  ws.on("message", (raw) => {
-    let m;
-    try { m = JSON.parse(raw); } catch { return; }
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
 
-    if (m.type === "list-competitions") {
-      const list = [...rooms.entries()]
-        .map(([pin, room]) => ({
-          pin,
-          name: room.compName || "",
-          athletes: [...room.values()].filter((c) => c.meta.role === "athlete").length,
-          raceStarted: !!room.raceStarted,
-        }))
-        .filter((r) => r.athletes > 0 || r.raceStarted);
-      ws.send(JSON.stringify({ type: "competitions-list", competitions: list }));
-      return;
-    }
-
-    if (m.type === "join") {
-      let role = m.role, name = m.name, uid = m.uid;
-
-      // NOVO: exige token válido para quem afirma ser SEF ou atleta.
-      if (role === "central" || role === "athlete") {
-        try {
-          const payload = jwt.verify(m.token || "", JWT_SECRET);
-          if (payload.role !== role) {
-            ws.send(JSON.stringify({ type: "join-error", message: "Sessão não corresponde ao papel escolhido." }));
-            return;
-          }
-          role = payload.role;
-          name = payload.name;
-          uid = payload.username;
-        } catch {
-          ws.send(JSON.stringify({ type: "join-error", message: "Sessão inválida ou expirada. Faça login novamente." }));
+    if (msg.type === "join") {
+      // Espectador não tem login — para atleta/SEF, o token do /api/login precisa ser válido.
+      if (msg.role !== "spectator") {
+        try { jwt.verify(msg.token || "", JWT_SECRET); }
+        catch {
+          ws.send(JSON.stringify({ type: "join-error", message: "Sessão inválida. Faça login novamente." }));
           return;
         }
       }
 
-      ws.roomId = m.room || "COESPA-DEMO";
-      ws.meta = { role, name, uid };
-      const room = getRoom(ws.roomId);
-      if (role === "central" && m.compName) room.compName = m.compName;
-      room.set(ws.id, ws);
+      ws.room = msg.room || "COESPA-DEMO";
+      ws.role = msg.role;
+      ws.name = msg.name;
+      ws.uid = msg.uid;
+      if (ws.role === "central" && msg.compName) competitionNames.set(ws.room, msg.compName);
 
-      const peers = [...room.entries()]
-        .filter(([id]) => id !== ws.id)
-        .map(([id, c]) => ({ id, role: c.meta.role, name: c.meta.name, uid: c.meta.uid }));
-      ws.send(JSON.stringify({ type: "joined", peers, raceStarted: !!room.raceStarted }));
-
-      for (const [id, c] of room) {
-        if (id !== ws.id && c.readyState === 1) {
-          c.send(JSON.stringify({ type: "peer-joined", peer: { id: ws.id, role: ws.meta.role, name: ws.meta.name, uid: ws.meta.uid } }));
+      // Se a sala não está em memória (primeira pessoa a entrar, ou o servidor
+      // reiniciou), tenta recuperar percurso/mapa/estado da prova salvos no Supabase.
+      if (!rooms.has(ws.room)) {
+        const saved = await loadCompetition(ws.room);
+        if (saved) {
+          if (saved.race_started) raceState.set(ws.room, true);
+          if (saved.name) competitionNames.set(ws.room, saved.name);
+          if (Array.isArray(saved.course) && saved.course.length) courseState.set(ws.room, saved.course);
+          if (saved.map_url && saved.map_corners) {
+            mapImageState.set(ws.room, { url: saved.map_url, corners: saved.map_corners, opacity: saved.map_opacity });
+          }
         }
       }
+      const peers = peersOf(ws.room);
+
+      const list = [...peers.values()].map(p => ({ id: p.id, role: p.role, name: p.name }));
+      ws.send(JSON.stringify({
+        type: "joined",
+        peers: list,
+        raceStarted: !!raceState.get(ws.room),
+        course: courseState.get(ws.room) || [],
+        mapImage: mapImageState.get(ws.room) || null,
+      }));
+
+      peers.forEach(p => p.ws.readyState === WebSocket.OPEN &&
+        p.ws.send(JSON.stringify({ type: "peer-joined", peer: { id: ws.id, role: ws.role, name: ws.name } })));
+
+      peers.set(ws.id, { id: ws.id, ws, role: ws.role, name: ws.name });
+
+      if (ws.role === "central") upsertCompetition(ws.room, { name: competitionNames.get(ws.room) || null });
       return;
     }
 
-    if (!ws.roomId) return;
-    const room = getRoom(ws.roomId);
-
-    if (["race-start", "race-stop", "race-reset"].includes(m.type)) {
-      if (ws.meta.role !== "central") return;
-      if (m.type === "race-start") room.raceStarted = true;
-      if (m.type === "race-stop") room.raceStarted = false;
-      for (const [, c] of room) if (c !== ws && c.readyState === 1) c.send(JSON.stringify(m));
-      return;
-    }
-
-    if (m.to !== undefined) {
-      const t = room.get(m.to);
-      if (t && t.readyState === 1) {
-        m.from = ws.id;
-        t.send(JSON.stringify(m));
+    if (["offer", "answer", "ice", "renegotiate"].includes(msg.type)) {
+      const peers = peersOf(ws.room);
+      const target = peers.get(msg.to);
+      if (target && target.ws.readyState === WebSocket.OPEN) {
+        target.ws.send(JSON.stringify({ ...msg, from: ws.id }));
       }
       return;
     }
 
-    for (const [id, c] of room) {
-      if (id !== ws.id && c.readyState === 1) c.send(JSON.stringify(m));
+    if (msg.type === "gps") {
+      broadcastToRoom(ws.room, { ...msg, from: ws.id }, ws.id);
+      logGps(ws.room, msg); // grava o histórico para replay/resultados futuros (não bloqueia o repasse)
+      return;
+    }
+    if (msg.type === "cam-status") {
+      broadcastToRoom(ws.room, { ...msg, from: ws.id }, ws.id);
+      return;
+    }
+
+    if (msg.type === "course-sync") {
+      if (ws.role !== "central") return;
+      courseState.set(ws.room, Array.isArray(msg.points) ? msg.points : []);
+      broadcastToRoom(ws.room, { type: "course-sync", points: courseState.get(ws.room) }, ws.id);
+      upsertCompetition(ws.room, { course: courseState.get(ws.room) });
+      return;
+    }
+
+    if (msg.type === "map-image") {
+      if (ws.role !== "central") return;
+      if (msg.remove) {
+        mapImageState.delete(ws.room);
+        broadcastToRoom(ws.room, { type: "map-image", remove: true }, ws.id);
+        upsertCompetition(ws.room, { map_url: null, map_corners: null, map_opacity: null });
+      } else if (msg.url && msg.corners) {
+        mapImageState.set(ws.room, { url: msg.url, corners: msg.corners, opacity: msg.opacity });
+        broadcastToRoom(ws.room, { type: "map-image", url: msg.url, corners: msg.corners, opacity: msg.opacity }, ws.id);
+        upsertCompetition(ws.room, { map_url: msg.url, map_corners: msg.corners, map_opacity: msg.opacity ?? null });
+      }
+      return;
+    }
+
+    if (msg.type === "list-competitions") {
+      const list = [...rooms.entries()]
+        .filter(([, peers]) => [...peers.values()].some(p => p.role === "central"))
+        .map(([room, peers]) => ({
+          pin: room,
+          name: competitionNames.get(room) || "",
+          athletes: [...peers.values()].filter(p => p.role === "athlete").length,
+          raceStarted: !!raceState.get(room),
+        }));
+      ws.send(JSON.stringify({ type: "competitions-list", competitions: list }));
+      return;
+    }
+
+    if (msg.type === "race-start" || msg.type === "race-stop" || msg.type === "race-reset") {
+      if (msg.type !== "race-reset") raceState.set(ws.room, msg.type === "race-start");
+      broadcastToRoom(ws.room, { ...msg, from: ws.id }, ws.id);
+      if (msg.type !== "race-reset") upsertCompetition(ws.room, { race_started: msg.type === "race-start" });
+      return;
     }
   });
 
   ws.on("close", () => {
-    if (!ws.roomId) return;
-    const room = getRoom(ws.roomId);
-    room.delete(ws.id);
-    if (!room.size) rooms.delete(ws.roomId);
-    for (const [, c] of room) if (c.readyState === 1) c.send(JSON.stringify({ type: "peer-left", id: ws.id }));
+    if (!ws.room) return;
+    const peers = peersOf(ws.room);
+    peers.delete(ws.id);
+    peers.forEach(p => p.ws.readyState === WebSocket.OPEN &&
+      p.ws.send(JSON.stringify({ type: "peer-left", id: ws.id })));
+    if (peers.size === 0) {
+      rooms.delete(ws.room);
+      raceState.delete(ws.room);
+      competitionNames.delete(ws.room);
+      courseState.delete(ws.room);
+      mapImageState.delete(ws.room);
+      // Note: os dados continuam salvos no Supabase mesmo com a sala vazia —
+      // só o cache em memória é limpo, para não crescer sem limite.
+    }
   });
-
-  ws.on("error", () => {});
 });
 
-// A cada 30s, fecha conexões que pararam de responder (celular sem sinal,
-// aba fechada sem avisar, etc.) para não acumular "fantasmas" em memória.
-setInterval(() => {
-  wss.clients.forEach((c) => {
-    if (c.isAlive === false) return c.terminate();
-    c.isAlive = false;
-    if (c.readyState === 1) c.ping();
-  });
-}, 30000);
+server.listen(PORT, () => console.log("COESPA Conectado rodando na porta " + PORT));
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("Servidor COESPA na porta " + PORT));
