@@ -23,8 +23,13 @@
 //     password_hash text not null,
 //     name text not null,
 //     role text not null check (role in ('athlete','central')),
+//     squad text,                 -- [ADICIONADO] esquadrão do atleta (Amarelo/Azul/Verde/Branco/Prata)
+//     million text,                -- [ADICIONADO] milhão, numeração única do aluno (ex.: "26/1137")
 //     created_at timestamptz default now()
 //   );
+//   -- Se a tabela já existe, rode em vez disso:
+//   --   alter table app_users add column if not exists squad text;
+//   --   alter table app_users add column if not exists million text;
 //   create table competitions (
 //     pin text primary key,
 //     name text,
@@ -111,15 +116,26 @@ app.post("/api/login", async (req, res) => {
 });
 
 app.post("/api/register", requireAuth, requireCentral, async (req, res) => {
-  const { username, password, name, role } = req.body || {};
+  const { username, password, name, role, squad, million } = req.body || {};
   if (!username || !password || !name || password.length < 4 || !["athlete", "central"].includes(role)) {
     return res.status(400).json({ error: "Preencha nome, usuário, um perfil válido e uma senha com pelo menos 4 caracteres." });
+  }
+  // [ADICIONADO] esquadrão e milhão só se aplicam a atletas; valida o formato do milhão (AA/NNNN)
+  // quando ele vier preenchido, mas não impede o cadastro de contas antigas que ainda não o enviem.
+  const SQUADS = ["Amarelo", "Azul", "Verde", "Branco", "Prata"];
+  if (role === "athlete" && squad && !SQUADS.includes(squad)) {
+    return res.status(400).json({ error: "Esquadrão inválido." });
+  }
+  if (role === "athlete" && million && !/^\d{2}\/\d{1,6}$/.test(String(million).trim())) {
+    return res.status(400).json({ error: "Milhão em formato inválido. Use AA/NNNN, ex.: 26/1137." });
   }
   if (!supabase) return res.status(503).json({ error: "Banco de dados não configurado no servidor." });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { error } = await supabase.from("app_users").insert({
       username: String(username).trim().toLowerCase(), password_hash: hash, name: String(name).trim(), role,
+      squad: role === "athlete" && squad ? squad : null,
+      million: role === "athlete" && million ? String(million).trim() : null,
     });
     if (error) {
       if (error.code === "23505") return res.status(409).json({ error: "Esse usuário já existe." });
@@ -135,7 +151,7 @@ app.post("/api/register", requireAuth, requireCentral, async (req, res) => {
 app.get("/api/users", requireAuth, requireCentral, async (req, res) => {
   if (!supabase) return res.json({ users: [] });
   try {
-    const { data, error } = await supabase.from("app_users").select("username,name,role").order("name");
+    const { data, error } = await supabase.from("app_users").select("username,name,role,squad,million").order("name"); // [ADICIONADO] squad,million
     if (error) throw error;
     res.json({ users: data || [] });
   } catch (e) {
@@ -333,4 +349,3 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => console.log("COESPA Conectado rodando na porta " + PORT));
-
